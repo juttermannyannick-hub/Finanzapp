@@ -2,11 +2,13 @@
 import MockDate from 'mockdate';
 
 import { aqlQuery } from '#server/aql';
+import { createAllBudgets } from '#server/budget/base';
 import * as db from '#server/db';
 import { loadMappings } from '#server/db/mappings';
 import { app as mainApp } from '#server/main-app';
 import { runMutator } from '#server/mutators';
 import * as prefs from '#server/prefs';
+import * as sheet from '#server/sheet';
 import {
   loadRules,
   runRules,
@@ -1674,6 +1676,142 @@ describe('schedule app', () => {
         await schedulesApp.stopServices();
       }
     });
+  });
+
+  describe('one-time and monthly expenses in the budget', () => {
+    // In tests `currentDay()` is 2017-01-01: December is the first month of
+    // spending and January the month after it.
+    let accountId: string;
+    let categoryId: string;
+
+    beforeEach(async () => {
+      schedulesApp.startServices();
+
+      await sheet.loadSpreadsheet(db);
+      await db.insertCategoryGroup({
+        id: 'income',
+        name: 'Income',
+        is_income: 1,
+      });
+      await db.insertCategoryGroup({ id: 'bills', name: 'Bills' });
+      categoryId = await db.insertCategory({
+        name: 'Subscriptions',
+        cat_group: 'bills',
+      });
+      await createAllBudgets();
+
+      accountId = await db.insertAccount({
+        name: 'Checking',
+        offbudget: 0,
+        closed: 0,
+      });
+    });
+
+    afterEach(() => schedulesApp.stopServices());
+
+    // An automatically posted expense, first due on 1 December. A new
+    // schedule starts at its next occurrence from today, so `next_date` is
+    // moved back as if the expense had been entered in December and the
+    // budget next opened on 1 January.
+    async function addAutoPostedExpense(
+      amount: number,
+      date: string | RecurConfig,
+    ) {
+      const id = await createSchedule({
+        schedule: { posts_transaction: true },
+        conditions: [
+          { op: 'is', field: 'account', value: accountId },
+          { op: 'is', field: 'amount', value: amount },
+          { op: 'is', field: 'date', value: date },
+        ],
+      });
+      const nextDateRow = await db.first<{ id: string }>(
+        'SELECT id FROM schedules_next_date WHERE schedule_id = ?',
+        [id],
+      );
+      await db.update('schedules_next_date', {
+        id: nextDateRow.id,
+        local_next_date: 20161201,
+        local_next_date_ts: Date.now(),
+        base_next_date: 20161201,
+        base_next_date_ts: Date.now(),
+      });
+
+      // A schedule's category lives on its rule ("Edit as rule"); without
+      // one, the posted transaction never reaches a budget category.
+      const { data: ruleId } = await aqlQuery(
+        q('schedules').filter({ id }).calculate('rule'),
+      );
+      const ruleRow = await db.first<Pick<db.DbRule, 'actions'>>(
+        'SELECT actions FROM rules WHERE id = ?',
+        [ruleId],
+      );
+      await updateRule({
+        id: ruleId,
+        actions: [
+          ...JSON.parse(ruleRow.actions),
+          { op: 'set', field: 'category', value: categoryId },
+        ],
+      });
+    }
+
+    async function spent(month: string) {
+      await sheet.waitOnSpreadsheet();
+      return sheet.getCellValue(
+        monthUtils.sheetForMonth(month),
+        `sum-amount-${categoryId}`,
+      );
+    }
+
+    async function expenses() {
+      const { data } = await aqlQuery(
+        q('transactions').select(['date', 'amount']),
+      );
+      return data
+        .map(({ date, amount }) => ({ date, amount }))
+        .sort((a, b) => a.date.localeCompare(b.date) || a.amount - b.amount);
+    }
+
+    it.each(['a transaction', 'a one-time schedule'])(
+      'counts a one-time expense entered as %s once and a monthly expense every month',
+      async oneTimeKind => {
+        if (oneTimeKind === 'a transaction') {
+          await db.insertTransaction({
+            date: '2016-12-01',
+            amount: -3000,
+            account: accountId,
+            category: categoryId,
+          });
+        } else {
+          await addAutoPostedExpense(-3000, '2016-12-01');
+        }
+        await addAutoPostedExpense(-1000, {
+          start: '2016-12-01',
+          frequency: 'monthly',
+          patterns: [],
+        });
+
+        const expected = [
+          { date: '2016-12-01', amount: -3000 },
+          { date: '2016-12-01', amount: -1000 },
+          { date: '2017-01-01', amount: -1000 },
+        ];
+
+        // Opening the budget posts every occurrence that came due.
+        await advanceSchedulesService(true);
+
+        expect(await spent('2016-12')).toBe(-4000);
+        expect(await spent('2017-01')).toBe(-1000);
+        expect(await expenses()).toEqual(expected);
+
+        // Opening it again the same day (a reload) posts nothing twice.
+        await advanceSchedulesService(true);
+
+        expect(await spent('2016-12')).toBe(-4000);
+        expect(await spent('2017-01')).toBe(-1000);
+        expect(await expenses()).toEqual(expected);
+      },
+    );
   });
 
   describe('schedule advancement failures', () => {
