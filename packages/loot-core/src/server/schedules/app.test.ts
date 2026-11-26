@@ -1709,10 +1709,9 @@ describe('schedule app', () => {
 
     afterEach(() => schedulesApp.stopServices());
 
-    // An automatically posted expense, first due on 1 December. A new
-    // schedule starts at its next occurrence from today, so `next_date` is
-    // moved back as if the expense had been entered in December and the
-    // budget next opened on 1 January.
+    // A new schedule starts at its next occurrence from today, so
+    // `next_date` is moved back to the first due date, as if the expense had
+    // been entered then and the budget next opened on 1 January.
     async function addAutoPostedExpense(
       amount: number,
       date: string | RecurConfig,
@@ -1725,15 +1724,18 @@ describe('schedule app', () => {
           { op: 'is', field: 'date', value: date },
         ],
       });
+      const firstDueDate = db.toDateRepr(
+        typeof date === 'string' ? date : date.start,
+      );
       const nextDateRow = await db.first<{ id: string }>(
         'SELECT id FROM schedules_next_date WHERE schedule_id = ?',
         [id],
       );
       await db.update('schedules_next_date', {
         id: nextDateRow.id,
-        local_next_date: 20161201,
+        local_next_date: firstDueDate,
         local_next_date_ts: Date.now(),
-        base_next_date: 20161201,
+        base_next_date: firstDueDate,
         base_next_date_ts: Date.now(),
       });
 
